@@ -14,6 +14,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from domain import DomainError, canonical, utcnow
+import notifications as notification_service
+from notifications import (
+    NOTIFICATION_SCHEMA,
+    assert_publishable,
+    confirm as confirm_notifications,
+    freeze_for_publish,
+    get_notification,
+    list_for_version,
+)
+from subscriptions import SUBSCRIPTION_SCHEMA, SubscriptionStore
+from impact import ImpactAnalyzer
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "transit_disruption.db"
 
@@ -42,16 +55,12 @@ def _within_window(value: int, start: int | None, end: int | None) -> bool:
     return start <= value <= end
 
 
-class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.status = status
-
-
 class Database:
     def __init__(self, path: str | os.PathLike[str] = DEFAULT_DB):
         self.path = str(path)
         self._init_schema()
+        self.subscriptions = SubscriptionStore(self)
+        self.impacts = ImpactAnalyzer(self)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10)
@@ -151,6 +160,7 @@ class Database:
                 );
                 """
             )
+            conn.executescript(SUBSCRIPTION_SCHEMA + NOTIFICATION_SCHEMA)
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -343,6 +353,8 @@ class Database:
                  int(accessible) if isinstance(accessible, bool) else None, canonical(payload), utcnow()),
             )
             conn.execute("UPDATE versions SET updated_at=? WHERE id=?", (utcnow(), version_id))
+            # 方案内容变了，基于旧内容算出的通知名单必须作废，要求重新分析确认。
+            notification_service.reset_run_for_version(conn, version_id)
             self._audit(conn, actor, "change.added", "version", version_id, {"kind": kind, "change_id": cur.lastrowid})
             return dict(conn.execute("SELECT * FROM changes WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -374,14 +386,19 @@ class Database:
             elif action == "publish":
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
+                # 发布闸门：必须先完成乘客影响分析并经调度员确认整份名单。
+                assert_publishable(conn, version_id)
+                # 名单在同一事务内随版本冻结（含乘客资料与替代路线快照）。
+                frozen_count = freeze_for_publish(conn, version_id)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
-                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
+                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn), "frozen_notification_count": frozen_count}
                 snapshot_text = canonical(snapshot)
                 digest = hashlib.sha256(snapshot_text.encode()).hexdigest()
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
             else:
                 raise DomainError("未知状态操作")
-            self._audit(conn, actor, f"version.{action}", "version", version_id, {})
+            audit_details = {"frozen_notifications": frozen_count} if action == "publish" else {}
+            self._audit(conn, actor, f"version.{action}", "version", version_id, audit_details)
         return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
 
     def _base_hash(self, conn: sqlite3.Connection) -> str:
@@ -416,26 +433,62 @@ class Database:
                 elif change["kind"] == "detour":
                     detours.append(change)
             graph: dict[int, list[tuple[int, int, dict[str, Any]]]] = {sid: [] for sid in stops}
+            # 按线路登记绕行走廊：绕行边取代同线路走廊内的全部常规通行，
+            # 走廊内中间站对该线路视同跳站（车辆走绕行边，不停靠），其他线路仍可服务这些站。
+            # 这样绕行变长才会真实增加乘客耗时；走廊外的边保持不变。
+            detour_by_line: dict[int | None, list[sqlite3.Row]] = {}
+            for change in detours:
+                detour_by_line.setdefault(change["line_id"], []).append(change)
+            spans_by_line: dict[int, list[tuple[int, int]]] = {}
+            bypassed_by_line: dict[int, set[int]] = {}
+            for line_id, line_detours in detour_by_line.items():
+                if line_id is None:
+                    continue
+                rows = memberships.get(line_id, [])
+                seq_by_stop = {int(r["stop_id"]): int(r["sequence"]) for r in rows}
+                for change in line_detours:
+                    ds = seq_by_stop.get(int(change["from_stop_id"]))
+                    de = seq_by_stop.get(int(change["to_stop_id"]))
+                    if ds is None or de is None:
+                        continue
+                    dlo, dhi = sorted((ds, de))
+                    spans_by_line.setdefault(line_id, []).append((dlo, dhi))
+                    for stop_id, sequence in seq_by_stop.items():
+                        if dlo < sequence < dhi:
+                            bypassed_by_line.setdefault(line_id, set()).add(stop_id)
+
             for line_id, rows in memberships.items():
                 if not rows:
                     continue
+                line_bypassed = bypassed_by_line.get(line_id, set())
+                spans = spans_by_line.get(line_id, [])
                 # Vehicles may pass a skipped or closed stop but passengers
                 # cannot board or alight there. Build one edge between each
                 # pair of usable stops and accumulate all omitted segment time.
                 usable = [
                     row for row in rows
                     if int(row["stop_id"]) not in closed
+                    and int(row["stop_id"]) not in line_bypassed
                     and not (require_accessible and (not stops[int(row["stop_id"])]["accessible"] or int(row["stop_id"]) in inaccessible))
                 ]
                 for current, nxt in zip(usable, usable[1:]):
+                    lo, hi = sorted((int(current["sequence"]), int(nxt["sequence"])))
+                    if any(dlo <= lo and hi <= dhi for dlo, dhi in spans):
+                        # 这对站点之间由绕行边接管，不再保留原走廊通行边。
+                        continue
                     between = [r for r in rows if int(current["sequence"]) < int(r["sequence"]) <= int(nxt["sequence"])]
                     minutes = sum(int(r["travel_minutes_from_previous"]) for r in between)
                     edge = {"line_id": line_id, "kind": "route", "from_sequence": current["sequence"], "to_sequence": nxt["sequence"]}
                     graph[int(current["stop_id"])].append((int(nxt["stop_id"]), minutes, edge))
                     reverse_edge = {"line_id": line_id, "kind": "route", "from_sequence": nxt["sequence"], "to_sequence": current["sequence"]}
                     graph[int(nxt["stop_id"])].append((int(current["stop_id"]), minutes, reverse_edge))
+            added_detours: set[tuple[int | None, int, int]] = set()
             for change in detours:
                 src, dst, minutes = int(change["from_stop_id"]), int(change["to_stop_id"]), int(change["travel_minutes"])
+                key = (change["line_id"], src, dst)
+                if key in added_detours:
+                    continue
+                added_detours.add(key)
                 if src in closed or dst in closed:
                     continue
                 if require_accessible and (not stops[src]["accessible"] or not stops[dst]["accessible"] or src in inaccessible or dst in inaccessible):
@@ -574,6 +627,21 @@ def seed_demo(db: Database) -> dict[str, int]:
     result = db.import_base("planner-01", data, "planner")
     if not result["accepted"]:
         raise RuntimeError(result["errors"])
+    stop_ids = {row["code"]: row["id"] for row in db.list_stops()}
+    now = utcnow()
+    # 两条示例订阅：一位走全程的普通乘客，一位只能走无障碍路线的早高峰乘客。
+    demo_subscriptions = [
+        ("张北站", stop_ids["S1"], stop_ids["S5"], 1380, 1470, 0),
+        ("李无障碍", stop_ids["S1"], stop_ids["S4"], 420, 600, 1),
+    ]
+    with db.connect() as conn:
+        for name, from_stop, to_stop, start, end, accessible in demo_subscriptions:
+            conn.execute(
+                """INSERT INTO passenger_subscriptions(passenger_name,from_stop_id,to_stop_id,
+                       service_start_minute,service_end_minute,accessible_only,created_by,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (name, from_stop, to_stop, start, end, accessible, "planner-01", now, now),
+            )
     return {"line": int(db.list_lines()[0]["id"])}
 
 
@@ -589,8 +657,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _html(self) -> None:
-        data = (ROOT / "static" / "index.html").read_bytes()
+    def _html(self, page: str = "index") -> None:
+        pages = {"index": "index.html", "notifications": "notifications.html"}
+        data = (ROOT / "static" / pages[page]).read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -613,7 +682,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path in {"/", "/index.html"}:
-                return self._html()
+                return self._html("index")
+            if parsed.path in {"/notifications", "/notifications.html"}:
+                return self._html("notifications")
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             endpoints = {
@@ -625,11 +696,17 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/import-errors": self.db.list_import_errors,
                 "/api/audit": self.db.audit,
             }
+            if parsed.path == "/api/subscriptions":
+                return self._send({"items": self.db.subscriptions.list()})
             if parsed.path in endpoints:
                 return self._send({"items": endpoints[parsed.path]()})
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) == 3 and parts[:2] == ["api", "versions"]:
                 return self._send(self.db.get_version(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "notifications":
+                return self._send(list_for_version(self.db, int(parts[2])))
+            if len(parts) == 3 and parts[:2] == ["api", "notifications"]:
+                return self._send(get_notification(self.db, int(parts[2])))
             if len(parts) == 3 and parts[:2] == ["api", "trips"]:
                 return self._send({"times": self.db.trip_times(int(parts[2]))})
             if parsed.path == "/api/route":
@@ -659,6 +736,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.add_change(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "approve", "reject", "publish"}:
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
+            if parts == ["api", "subscriptions"]:
+                return self._send(self.db.subscriptions.create(actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "analyze":
+                return self._send(self.db.impacts.analyze_version(int(parts[2]), actor, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "confirm":
+                return self._send(confirm_notifications(self.db, int(parts[2]), actor, role))
+            if len(parts) == 6 and parts[:2] == ["api", "versions"] and parts[3] == "notifications" and parts[5] == "confirm":
+                return self._send(confirm_notifications(self.db, int(parts[2]), actor, role, int(parts[4])))
+            raise DomainError("接口不存在", 404)
+        except (ValueError, TypeError, DomainError) as exc:
+            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            actor, role = self._auth()
+            body = self._body()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "subscriptions"]:
+                return self._send(self.db.subscriptions.update(int(parts[2]), actor, body, role))
+            raise DomainError("接口不存在", 404)
+        except (ValueError, TypeError, DomainError) as exc:
+            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            actor, role = self._auth()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "subscriptions"]:
+                return self._send(self.db.subscriptions.delete(int(parts[2]), actor, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))

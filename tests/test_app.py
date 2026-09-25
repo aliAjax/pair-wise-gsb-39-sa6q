@@ -22,6 +22,10 @@ class TransitFlowTest(unittest.TestCase):
         self.db.add_change(v1, "planner-01", {"kind": "stop_closure", "stop_id": self.stops["S4"]}, "planner")
         with self.assertRaises(DomainError):
             self.db.transition(v1, "planner-01", "planner", "publish")
+        # 发布前必须先分析乘客影响并确认通知名单（本场景无人受影响，名单为空也须显式确认）。
+        self.db.impacts.analyze_version(v1, "planner-01", "planner")
+        import notifications as notification_service
+        notification_service.confirm(self.db, v1, "planner-01", "planner")
         self.db.transition(v1, "planner-01", "planner", "submit")
         self.db.transition(v1, "reviewer-01", "reviewer", "approve")
         published = self.db.transition(v1, "reviewer-01", "reviewer", "publish")
@@ -33,6 +37,8 @@ class TransitFlowTest(unittest.TestCase):
         self.assertEqual(self.db.route(self.stops["S1"], self.stops["S5"], v2)["minutes"], 18)
         # Publishing v2 as a draft snapshot does not alter the old published v1.
         self.assertEqual(self.db.route(self.stops["S1"], self.stops["S5"], v1)["minutes"], 31)
+        self.db.impacts.analyze_version(v2, "planner-02", "planner")
+        notification_service.confirm(self.db, v2, "planner-02", "planner")
         self.db.transition(v2, "planner-02", "planner", "submit")
         self.db.transition(v2, "reviewer-02", "reviewer", "approve")
         self.db.transition(v2, "reviewer-02", "reviewer", "publish")

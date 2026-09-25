@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>乘客影响通知台</title>
+<style>
+:root{--line:#d9e1e8;--bg:#f5f7f9;--red:#b42318;--amber:#b54708;--green:#067647;--blue:#175cd3}
+body{font:15px/1.5 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 18px;color:#1d2939}
+h1{margin-bottom:4px}.sub{color:#475467;margin-top:0}
+.card{border:1px solid var(--line);border-radius:10px;padding:16px;margin:16px 0;background:#fff}
+.card h2{margin:0 0 12px;font-size:17px}
+input,select,button{padding:7px 9px;margin:3px;border:1px solid #cbd5e1;border-radius:6px;font:inherit}
+button{cursor:pointer;background:#fff}
+button.primary{background:var(--blue);color:#fff;border-color:var(--blue)}
+button.danger{color:var(--red);border-color:#fda29b}
+button.ok{color:var(--green);border-color:#6ce9a6}
+button:disabled{opacity:.5;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+th{background:var(--bg);font-weight:600}
+.tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600}
+.tag.route_broken{background:#fee4e2;color:var(--red)}
+.tag.detour_delay{background:#fef0c7;color:var(--amber)}
+.tag.accessibility_lost{background:#fef3f2;color:#c4320a}
+.tag.pending{background:#e0eaff;color:var(--blue)}
+.tag.confirmed{background:#dcfae6;color:var(--green)}
+.tag.frozen{background:#e9d7fe;color:#6941c6}
+.tag.draft{background:#e0eaff;color:var(--blue)}
+.tag.review{background:#fef0c7;color:var(--amber)}
+.tag.approved{background:#dcfae6;color:var(--green)}
+.tag.published{background:#e9d7fe;color:#6941c6}
+.muted{color:#667085;font-size:13px}
+pre{background:var(--bg);padding:10px;border-radius:8px;overflow:auto;max-height:260px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.flash{padding:8px 12px;border-radius:8px;margin:8px 0;display:none}
+.flash.err{background:#fee4e2;color:var(--red)}
+.flash.ok{background:#dcfae6;color:var(--green)}
+.path{font-size:12.5px;color:#344054}
+.locked{background:#f9fafb}
+</style>
+</head>
+<body>
+<h1>乘客影响通知台</h1>
+<p class="sub">登记乘客常用行程；选定草稿版本后比对基线路线与方案路线，原来走法中断、绕行多出 15 分钟或无障碍条件不满足的乘客进入待通知名单；调度员确认整份名单后才能发布，发布后随版本冻结。</p>
+
+<div class="card">
+  <div class="row">
+    <strong>身份</strong>
+    <input id="user" value="planner-01" size="12">
+    <select id="role"><option>planner</option><option>editor</option><option>reviewer</option><option>admin</option><option>viewer</option></select>
+    <a href="/">← 线路与方案主页</a>
+  </div>
+  <div id="flash" class="flash"></div>
+</div>
+
+<div class="card">
+  <h2>① 乘客订阅资料</h2>
+  <div class="row">
+    <input id="subName" placeholder="乘客称呼" size="10">
+    <label>起点 <input id="subFrom" type="number" size="4" style="width:70px"></label>
+    <label>终点 <input id="subTo" type="number" size="4" style="width:70px"></label>
+    <label>常用开始 <input id="subStart" type="number" value="480" style="width:80px" title="服务日零点起分钟，如 480=08:00"></label>
+    <label>常用结束 <input id="subEnd" type="number" value="1200" style="width:80px" title="服务日零点起分钟，如 1200=20:00"></label>
+    <label><input id="subAccessible" type="checkbox">只能走无障碍路线</label>
+    <button class="primary" onclick="createSub()">登记订阅</button>
+    <span class="muted">时间按服务日分钟填写（0–2880，可跨日）</span>
+  </div>
+  <table style="margin-top:12px">
+    <thead><tr><th>ID</th><th>乘客</th><th>起→终</th><th>常用服务时间</th><th>无障碍</th><th></th></tr></thead>
+    <tbody id="subRows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>② 选定草稿版本并分析影响</h2>
+  <div class="row">
+    <label>版本 ID <input id="versionId" type="number" value="1" style="width:80px"></label>
+    <button onclick="loadVersion()">载入版本</button>
+    <button class="primary" onclick="analyze()">分析乘客影响</button>
+    <span>版本状态：<span id="versionStatus" class="muted">未载入</span></span>
+    <span class="muted" id="versionMeta"></span>
+  </div>
+  <p class="muted" id="analyzeHint">分析只允许在草稿版本进行；方案或订阅有改动后需要重新分析。</p>
+</div>
+
+<div class="card">
+  <h2>③ 待通知名单（调度员确认）</h2>
+  <div class="row">
+    <button class="ok" onclick="confirmAll()">整单确认</button>
+    <button onclick="loadNotices()">刷新名单</button>
+    <span id="runMeta" class="muted"></span>
+  </div>
+  <table style="margin-top:12px">
+    <thead><tr><th>ID</th><th>乘客 / 行程</th><th>影响原因</th><th>基线 → 方案</th><th>可走替代路线</th><th>状态</th><th></th></tr></thead>
+    <tbody id="noticeRows"><tr><td colspan="7" class="muted">尚未分析。</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>版本流转</h2>
+  <div class="row">
+    <button onclick="act('submit')">提交复核</button>
+    <button onclick="act('approve')">批准</button>
+    <button class="danger" onclick="act('reject')">退回草稿</button>
+    <button class="primary" onclick="act('publish')">发布（冻结名单）</button>
+  </div>
+  <pre id="actionOut" class="muted">等待操作…</pre>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+function flash(msg,ok=false){const f=$('flash');f.textContent=msg;f.className='flash '+(ok?'ok':'err');setTimeout(()=>f.className='flash',6000)}
+async function call(url,opts={}){
+  const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','X-User':$('user').value,'X-Role':$('role').value,...(opts.headers||{})}});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(j.error||r.status);
+  return j;
+}
+function clock(min){if(min==null)return'—';const d=Math.floor(min/1440);const m=min%1440;const h=String(Math.floor(m/60)).padStart(2,'0');const mm=String(m%60).padStart(2,'0');return h+':'+mm+(d?`(+${d}日)`:'');}
+function windowLabel(s,e){return clock(s)+' – '+clock(e-1);}
+async function loadSubs(){
+  try{
+    const j=await call('/api/subscriptions');
+    const tbody=$('subRows');
+    if(!j.items.length){tbody.innerHTML='<tr><td colspan="6" class="muted">还没有订阅。</td></tr>';return;}
+    tbody.innerHTML=j.items.map(s=>`<tr>
+      <td>${s.id}</td>
+      <td><strong>${s.passenger_name}</strong>${s.accessible_only?' <span class="tag accessibility_lost">仅无障碍</span>':''}</td>
+      <td>${s.from_stop_id} → ${s.to_stop_id}</td>
+      <td class="muted">${windowLabel(s.service_start_minute,s.service_end_minute)}</td>
+      <td>${s.accessible_only?'必须':'普通'}</td>
+      <td><button onclick="fillSub(${s.id},'${s.passenger_name}',${s.from_stop_id},${s.to_stop_id},${s.service_start_minute},${s.service_end_minute},${s.accessible_only})">改</button>
+          <button class="danger" onclick="delSub(${s.id})">删</button></td>
+    </tr>`).join('');
+  }catch(e){flash(e.message)}
+}
+function fillSub(id,name,f,t,ss,se,acc){$('subName').value=name;$('subFrom').value=f;$('subTo').value=t;$('subStart').value=ss;$('subEnd').value=se;$('subAccessible').checked=!!acc;$('subName').dataset.id=id}
+async function createSub(){
+  const id=$('subName').dataset.id;
+  const body={passenger_name:$('subName').value,from_stop_id:+$('subFrom').value,to_stop_id:+$('subTo').value,
+    service_start_minute:+$('subStart').value,service_end_minute:+$('subEnd').value,accessible_only:$('subAccessible').checked};
+  try{
+    if(id){await call('/api/subscriptions/'+id,{method:'PUT',body:JSON.stringify(body)});flash('订阅已更新；草稿名单已作废，需要重新分析',true)}
+    else{await call('/api/subscriptions',{method:'POST',body:JSON.stringify(body)});flash('订阅已登记',true)}
+    delete $('subName').dataset.id;['subName','subFrom','subTo'].forEach(x=>$(x).value='');
+    loadSubs();
+  }catch(e){flash(e.message)}
+}
+async function delSub(id){if(!confirm('确认删除该订阅？'))return;try{await call('/api/subscriptions/'+id,{method:'DELETE'});flash('订阅已删除；草稿名单已作废',true);loadSubs()}catch(e){flash(e.message)}}
+
+let currentVersion=null;
+async function loadVersion(){
+  const id=+$('versionId').value;
+  try{
+    const v=await call('/api/versions/'+id);
+    currentVersion=v;
+    $('versionStatus').innerHTML=`<span class="tag ${v.status}">${v.status}</span> v${v.version_no}`;
+    $('versionMeta').textContent=`版本 ${v.id} · 中断 ${v.disruption_id} · 更新 ${v.updated_at}`;
+    $('analyzeHint').textContent=v.status==='draft'?'可以分析：系统将比对基线与当前方案。':'只有草稿版本可以分析；如需调整请先退回草稿。';
+    loadNotices();
+  }catch(e){flash(e.message)}
+}
+async function analyze(){
+  try{
+    const j=await call('/api/versions/'+$('versionId').value+'/analyze',{method:'POST',body:'{}'});
+    renderNotices(j);flash(`分析完成：${j.total_count} 位乘客待通知，${(j.skipped||[]).length} 位基线本就不通已跳过`,true);
+    loadVersion();
+  }catch(e){flash(e.message)}
+}
+function altLabel(alt){
+  if(!alt)return '<span class="muted">实在接不上，已保留原因</span>';
+  const stops=(alt.stops||[]).map(s=>`${s.name}${s.accessible?'':'♿'}`).join(' → ');
+  const kinds=(alt.legs||[]).map(l=>l.kind==='detour'?'绕行':'常规').join(' / ');
+  return `<div class="path">${stops}</div><div class="muted">${kinds} · ${alt.minutes} 分钟 · 约 ${alt.arrival?alt.arrival.clock:''} 到达</div>`;
+}
+function renderNotices(j){
+  $('runMeta').textContent=j.analyzed?`分析人 ${j.analyzed_by} · ${j.analyzed_at} · 确认 ${j.confirmed_count}/${j.total_count} · 名单状态 ${j.status}`:'该版本还没有分析。';
+  const tb=$('noticeRows');
+  if(!j.analyzed){tb.innerHTML='<tr><td colspan="7" class="muted">尚未分析。</td></tr>';return;}
+  if(!j.items.length){tb.innerHTML='<tr><td colspan="7" class="muted">没有乘客受影响——请整单确认后继续发布。</td></tr>';return;}
+  tb.innerHTML=j.items.map(n=>{
+    const s=n.subscription||{};
+    const time=n.baseline_minutes==null?'—':`${n.baseline_minutes} 分 → ${n.plan_minutes==null?'<strong style="color:#b42318">中断</strong>':n.plan_minutes+' 分'}${n.extra_minutes?`（多 ${n.extra_minutes} 分）`:''}`;
+    const frozen=n.status==='frozen';
+    return `<tr class="${frozen?'locked':''}"><td>${n.id}</td>
+      <td><strong>${s.passenger_name||('乘客#'+n.subscription_id)}</strong>${s.accessible_only?' <span class="tag accessibility_lost">仅无障碍</span>':''}
+        <div class="muted">${s.from_stop_id} → ${s.to_stop_id} · ${windowLabel(s.service_start_minute??0,(s.service_end_minute??0)+1)}</div></td>
+      <td><span class="tag ${n.reason_code}">${n.reason_code}</span><div class="muted">${n.reason}</div></td>
+      <td>${time}<div class="muted">评估时刻 ${clock(n.evaluated_at_minute)}</div></td>
+      <td>${altLabel(n.alternative)}</td>
+      <td><span class="tag ${n.status}">${n.status}</span>${n.confirmed_by?`<div class="muted">${n.confirmed_by}</div>`:''}</td>
+      <td>${n.status==='pending'?`<button class="ok" onclick="confirmOne(${n.id})">确认</button>`:''}</td>
+    </tr>`;
+  }).join('');
+}
+async function loadNotices(){
+  try{renderNotices(await call('/api/versions/'+$('versionId').value+'/notifications'))}catch(e){flash(e.message)}
+}
+async function confirmOne(id){
+  try{renderNotices(await call(`/api/versions/${$('versionId').value}/notifications/${id}/confirm`,{method:'POST',body:'{}'}));flash('已确认该条',true)}catch(e){flash(e.message)}
+}
+async function confirmAll(){
+  try{renderNotices(await call('/api/versions/'+$('versionId').value+'/confirm',{method:'POST',body:'{}'}));flash('整份名单已确认，可以进入发布流程',true)}catch(e){flash(e.message)}
+}
+async function act(name){
+  try{
+    const v=await call('/api/versions/'+$('versionId').value+'/'+name,{method:'POST',body:'{}'});
+    $('actionOut').textContent=JSON.stringify({status:v.status,published_at:v.published_at,snapshot_hash:v.snapshot_hash},null,2);
+    flash('操作成功：'+name,true);loadVersion();loadSubs();
+  }catch(e){flash(e.message);$('actionOut').textContent=e.message}
+}
+loadSubs();
+</script>
+</body>
+</html>
