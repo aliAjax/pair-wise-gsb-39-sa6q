@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>乘客影响通知台</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1180px;margin:32px auto;padding:0 18px;color:#22303c}
+input,select,button{padding:7px;margin:3px}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+table{border-collapse:collapse;width:100%;margin:8px 0;font-size:14px}
+th,td{border:1px solid #d9e1e8;padding:7px 9px;text-align:left;vertical-align:top}
+th{background:#f1f5f8}
+pre{background:#f5f7f9;padding:12px;overflow:auto;font-size:12px}
+button{cursor:pointer;border-radius:6px;border:1px solid #9fb3c3;background:#eef4f8}
+button.primary{background:#2563a8;color:#fff;border-color:#2563a8}
+.badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px}
+.badge-missing{background:#eee;color:#666}
+.badge-pending{background:#fff2d6;color:#8a5a00}
+.badge-confirmed{background:#dcf3e4;color:#17663a}
+.badge-frozen{background:#dcecff;color:#114488}
+.tag-broken{background:#fde2e2;color:#9b1c1c}
+.tag-detour_delay{background:#fdecd3;color:#8a4b00}
+.tag-accessibility{background:#e7e2fb;color:#4b2c9e}
+.muted{color:#667}
+a{color:#2563a8}
+</style></head>
+<body>
+<h1>乘客影响通知台</h1>
+<p class="muted">选定施工方案的草稿版本后，系统按基线路线与方案路线逐条比对常用行程：原走法断掉、绕行多出 15 分钟及以上、或无障碍条件不满足的乘客进入待通知名单，并附可走替代路线；接不上则保留原因。名单经调度员确认后方案才能发布，发布后随版本冻结。<a href="/">返回方案发布台</a></p>
+
+<div class="card">
+  <h2>身份</h2>
+  <input id="user" value="planner-01">
+  <select id="role"><option>planner</option><option>editor</option><option>reviewer</option><option>admin</option></select>
+</div>
+
+<div class="card">
+  <h2>乘客订阅资料</h2>
+  <p class="muted">登记起终点、常用服务时间窗（服务日分钟，如 450–540 表示 07:30–09:00），以及是否只能走无障碍路线。</p>
+  <label>乘客 <input id="pName" placeholder="姓名"></label>
+  <label>联系方式 <input id="pContact" placeholder="选填"></label>
+  <label>起点 ID <input id="pOrigin" type="number" style="width:80px"></label>
+  <label>终点 ID <input id="pDest" type="number" style="width:80px"></label>
+  <label>服务时间起 <input id="pStart" type="number" value="450" style="width:80px"></label>
+  <label>止 <input id="pEnd" type="number" value="540" style="width:80px"></label>
+  <label><input id="pAccessible" type="checkbox">只能走无障碍路线</label>
+  <button class="primary" onclick="registerSub()">登记订阅</button>
+  <button onclick="loadSubs()">刷新名单</button>
+  <pre id="subMsg" class="muted">等待操作…</pre>
+  <div id="subTable"></div>
+</div>
+
+<div class="card">
+  <h2>版本影响评估</h2>
+  <label>草稿版本 ID <input id="version" type="number" value="1" style="width:90px"></label>
+  <button class="primary" onclick="evaluateList()">按草稿重新评估</button>
+  <button onclick="loadList()">查看名单</button>
+  <button onclick="confirmList()">调度员确认名单</button>
+  <pre id="listMsg" class="muted">等待操作…</pre>
+  <div id="listArea"></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const auth=()=>({'Content-Type':'application/json','X-User':$('user').value,'X-Role':$('role').value});
+const REASON_TEXT={broken:'原走法断掉',detour_delay:'绕行多 15 分钟+',accessibility:'无障碍不满足'};
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function clock(m){if(m==null)return '—';const d=Math.floor(m/1440),x=m%1440,t=String(Math.floor(x/60)).padStart(2,'0')+':'+String(x%60).padStart(2,'0');return d?t+'(+'+d+'日)':t}
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
+
+async function registerSub(){
+  const body={passenger_name:$('pName').value,contact:$('pContact').value,
+    origin_stop_id:+$('pOrigin').value,destination_stop_id:+$('pDest').value,
+    service_start_minute:+$('pStart').value,service_end_minute:+$('pEnd').value,
+    require_accessible:$('pAccessible').checked};
+  try{const j=await call('/api/subscriptions',{method:'POST',headers:auth(),body:JSON.stringify(body)});
+    $('subMsg').textContent='已登记订阅 #'+j.id+'（基线可达 '+j.service_window.start_clock+' 起出行）';loadSubs();}
+  catch(e){$('subMsg').textContent='登记失败：'+e.message}
+}
+async function deactivate(id){
+  try{await call('/api/subscriptions/'+id+'/deactivate',{method:'POST',headers:auth(),body:'{}'});loadSubs();}
+  catch(e){$('subMsg').textContent='停用失败：'+e.message}
+}
+function renderSubs(items){
+  if(!items.length){$('subTable').innerHTML='<p class="muted">暂无生效订阅。</p>';return}
+  let html='<table><tr><th>ID</th><th>乘客</th><th>联系方式</th><th>起→终</th><th>常用服务时间</th><th>仅无障碍</th><th></th></tr>';
+  for(const s of items){
+    html+=`<tr><td>${s.id}</td><td>${esc(s.passenger.name)}</td><td>${esc(s.passenger.contact)}</td>
+      <td>${s.origin_stop_id} → ${s.destination_stop_id}</td>
+      <td>${clock(s.service_start_minute)}–${clock(s.service_end_minute)}</td>
+      <td>${s.require_accessible?'是':'否'}</td>
+      <td><button onclick="deactivate(${s.id})">停用</button></td></tr>`;
+  }
+  $('subTable').innerHTML=html+'</table>';
+}
+async function loadSubs(){
+  try{const j=await call('/api/subscriptions');renderSubs(j.items);}
+  catch(e){$('subMsg').textContent='加载失败：'+e.message}
+}
+
+function routeText(route){
+  if(!route)return '<span class="muted">无可走路线（原因已保留）</span>';
+  const chain=route.stop_chain.map(s=>esc(s.name)+'['+esc(s.code)+']').join(' → ');
+  const lines=[...new Set(route.legs.map(l=>l.line?esc(l.line.code):'?'))].join(', ');
+  return `<div>替代路线（${esc(lines)}，约 ${route.minutes} 分钟）：${chain}</div>`;
+}
+function renderList(list){
+  const badge=`<span class="badge badge-${list.status}">${({missing:'未生成',pending:'待确认',confirmed:'已确认',frozen:'已冻结'})[list.status]}</span>`;
+  let head=`<h3>版本 ${list.version_id} 通知名单 ${badge}`;
+  if(list.confirmed_by)head+=` <span class="muted">确认人：${esc(list.confirmed_by)}</span>`;
+  if(list.frozen_at)head+=` <span class="muted">冻结于：${esc(list.frozen_at)}</span>`;
+  head+=` <span class="muted">受影响乘客：${list.affected_count??list.entries.length} 人</span></h3>`;
+  if(!list.entries||!list.entries.length){$('listArea').innerHTML=head+'<p class="muted">名单为空，没有需要通知的乘客。</p>';return}
+  let html=head+'<table><tr><th>乘客</th><th>行程</th><th>常用时间</th><th>无障碍</th><th>影响原因</th><th>耗时变化（基线→方案）</th><th>替代路线</th></tr>';
+  for(const e of list.entries){
+    const change=e.plan_minutes==null?'<strong>断掉</strong>':e.baseline_minutes+' → '+e.plan_minutes+' 分钟（+'+(e.extra_minutes??0)+'）';
+    html+=`<tr><td>${esc(e.passenger_name)}<div class="muted">${esc(e.contact||'')}</div></td>
+      <td>${e.origin_stop_id} → ${e.destination_stop_id}</td>
+      <td>${clock(e.service_start_minute)}–${clock(e.service_end_minute)}<div class="muted">比对时刻 ${clock(e.at_minute)}</div></td>
+      <td>${e.require_accessible?'只能无障碍':'不限'}</td>
+      <td><span class="badge tag-${e.reason}">${REASON_TEXT[e.reason]||e.reason}</span><div class="muted">${esc(e.reason_detail)}</div></td>
+      <td>${change}</td><td>${routeText(e.alternative_route)}</td></tr>`;
+  }
+  $('listArea').innerHTML=html+'</table>';
+}
+async function evaluateList(){
+  $('listMsg').textContent='评估中…';
+  try{const j=await call('/api/versions/'+$('version').value+'/notifications/evaluate',{method:'POST',headers:auth(),body:'{}'});
+    $('listMsg').textContent='评估完成：'+j.affected_count+' 名乘客受影响，请逐条核对后确认。';renderList(j);}
+  catch(e){$('listMsg').textContent='评估失败：'+e.message}
+}
+async function confirmList(){
+  try{const j=await call('/api/versions/'+$('version').value+'/notifications/confirm',{method:'POST',headers:auth(),body:'{}'});
+    $('listMsg').textContent='名单已确认（确认人 '+j.confirmed_by+'），方案现在可以走完批准发布流程。';renderList(j);}
+  catch(e){$('listMsg').textContent='确认失败：'+e.message}
+}
+async function loadList(){
+  try{renderList(await call('/api/versions/'+$('version').value+'/notifications'));}
+  catch(e){$('listMsg').textContent='加载失败：'+e.message}
+}
+loadSubs();loadList();
+</script></body></html>

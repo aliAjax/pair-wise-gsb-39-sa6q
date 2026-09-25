@@ -6,20 +6,22 @@ import hashlib
 import heapq
 import json
 import math
+import mimetypes
 import os
 import sqlite3
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import notifications as notifications_store
+import subscriptions as subscription_store
+from errors import DomainError, utcnow
+from notifications import NotificationRepository
+from subscriptions import SubscriptionRepository
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "transit_disruption.db"
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def canonical(value: Any) -> str:
@@ -42,15 +44,11 @@ def _within_window(value: int, start: int | None, end: int | None) -> bool:
     return start <= value <= end
 
 
-class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.status = status
-
-
 class Database:
     def __init__(self, path: str | os.PathLike[str] = DEFAULT_DB):
         self.path = str(path)
+        self.subscriptions = SubscriptionRepository(self)
+        self.notifications = NotificationRepository()
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -151,6 +149,8 @@ class Database:
                 );
                 """
             )
+            self.subscriptions.create_tables(conn)
+            self.notifications.create_tables(conn)
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -374,8 +374,11 @@ class Database:
             elif action == "publish":
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
+                # 发布前名单必须已经过调度员确认；冻结与方案快照在同一事务内完成，
+                # 之后基础数据、订阅再修改也不动这份名单。
+                notification_snapshot = self.notifications.freeze_for_publish(self, conn, version, actor)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
-                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
+                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn), "notifications": notification_snapshot}
                 snapshot_text = canonical(snapshot)
                 digest = hashlib.sha256(snapshot_text.encode()).hexdigest()
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
@@ -509,6 +512,49 @@ class Database:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM stops ORDER BY id").fetchall()]
 
+    # -- 乘客影响通知台：订阅资料与名单的服务入口 ---------------------------
+
+    def _query_stops(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM stops ORDER BY id").fetchall()
+
+    def _query_lines(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM lines ORDER BY id").fetchall()
+
+    def register_subscription(self, actor: str, role: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            result = self.subscriptions.register(
+                conn, actor, role, payload,
+                lambda o, d, m, a: self.route(o, d, None, m, a))
+            self._audit(conn, actor, "subscription.registered", "subscription",
+                        result["id"], {"origin": result["origin_stop_id"],
+                                       "destination": result["destination_stop_id"]})
+            return result
+
+    def deactivate_subscription(self, subscription_id: int, actor: str, role: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            result = self.subscriptions.deactivate(conn, actor, role, subscription_id)
+            self._audit(conn, actor, "subscription.deactivated", "subscription", subscription_id, {})
+            return result
+
+    def list_subscriptions(self, include_inactive: bool = False) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if include_inactive:
+                return self.subscriptions.list_all(conn)
+            return self.subscriptions.list_active(conn)
+
+    def evaluate_notifications(self, version_id: int, actor: str, role: str) -> dict[str, Any]:
+        return self.notifications.evaluate(self, version_id, actor, role)
+
+    def confirm_notifications(self, version_id: int, actor: str, role: str) -> dict[str, Any]:
+        return self.notifications.confirm(self, version_id, actor, role)
+
+    def get_notifications(self, version_id: int) -> dict[str, Any]:
+        return self.notifications.get_for_version(self, version_id)
+
     def list_trips(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM trips ORDER BY id").fetchall()]
@@ -574,6 +620,20 @@ def seed_demo(db: Database) -> dict[str, int]:
     result = db.import_base("planner-01", data, "planner")
     if not result["accepted"]:
         raise RuntimeError(result["errors"])
+    stop_ids = {row["code"]: row["id"] for row in db.list_stops()}
+    # 常用行程示例：通勤、跨日晚归、仅无障碍
+    for passenger in (
+        {"passenger_name": "王通勤", "contact": "wang@example.com",
+         "origin_stop_id": stop_ids["S1"], "destination_stop_id": stop_ids["S5"],
+         "service_start_minute": 450, "service_end_minute": 540, "require_accessible": False},
+        {"passenger_name": "夜归李", "contact": "li@example.com",
+         "origin_stop_id": stop_ids["S1"], "destination_stop_id": stop_ids["S5"],
+         "service_start_minute": 1410, "service_end_minute": 1460, "require_accessible": False},
+        {"passenger_name": "轮椅张", "contact": "zhang@example.com",
+         "origin_stop_id": stop_ids["S2"], "destination_stop_id": stop_ids["S5"],
+         "service_start_minute": 480, "service_end_minute": 600, "require_accessible": True},
+    ):
+        db.register_subscription("planner-01", "planner", passenger)
     return {"line": int(db.list_lines()[0]["id"])}
 
 
@@ -597,6 +657,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _static_page(self, name: str) -> None:
+        path = (ROOT / "static" / name).resolve()
+        if ROOT not in path.parents or not path.is_file():
+            raise DomainError("页面不存在", 404)
+        data = path.read_bytes()
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         if not length:
@@ -614,6 +686,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in {"/", "/index.html"}:
                 return self._html()
+            if parsed.path in {"/notifications", "/notifications.html"}:
+                return self._static_page("notifications.html")
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             endpoints = {
@@ -625,11 +699,16 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/import-errors": self.db.list_import_errors,
                 "/api/audit": self.db.audit,
             }
+            if parsed.path == "/api/subscriptions":
+                include_all = parse_qs(parsed.query).get("all", ["false"])[0].lower() == "true"
+                return self._send({"items": self.db.list_subscriptions(include_all)})
             if parsed.path in endpoints:
                 return self._send({"items": endpoints[parsed.path]()})
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) == 3 and parts[:2] == ["api", "versions"]:
                 return self._send(self.db.get_version(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "notifications":
+                return self._send(self.db.get_notifications(int(parts[2])))
             if len(parts) == 3 and parts[:2] == ["api", "trips"]:
                 return self._send({"times": self.db.trip_times(int(parts[2]))})
             if parsed.path == "/api/route":
@@ -649,6 +728,10 @@ class Handler(BaseHTTPRequestHandler):
             parts = [p for p in parsed.path.split("/") if p]
             if parts == ["api", "import"]:
                 return self._send(self.db.import_base(actor, body, role))
+            if parts == ["api", "subscriptions"]:
+                return self._send(self.db.register_subscription(actor, role, body), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "subscriptions"] and parts[3] == "deactivate":
+                return self._send(self.db.deactivate_subscription(int(parts[2]), actor, role))
             if parts == ["api", "disruptions"]:
                 return self._send(self.db.create_disruption(actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[3] == "versions":
@@ -659,6 +742,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.add_change(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "approve", "reject", "publish"}:
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
+            if len(parts) == 5 and parts[:2] == ["api", "versions"] and parts[3] == "notifications" and parts[4] in {"evaluate", "confirm"}:
+                if parts[4] == "evaluate":
+                    return self._send(self.db.evaluate_notifications(int(parts[2]), actor, role))
+                return self._send(self.db.confirm_notifications(int(parts[2]), actor, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))

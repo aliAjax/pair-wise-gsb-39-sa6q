@@ -22,6 +22,9 @@ class TransitFlowTest(unittest.TestCase):
         self.db.add_change(v1, "planner-01", {"kind": "stop_closure", "stop_id": self.stops["S4"]}, "planner")
         with self.assertRaises(DomainError):
             self.db.transition(v1, "planner-01", "planner", "publish")
+        # 新规则：草稿阶段生成乘客影响名单并经调度员确认后才能发布
+        self.db.evaluate_notifications(v1, "planner-01", "planner")
+        self.db.confirm_notifications(v1, "planner-01", "planner")
         self.db.transition(v1, "planner-01", "planner", "submit")
         self.db.transition(v1, "reviewer-01", "reviewer", "approve")
         published = self.db.transition(v1, "reviewer-01", "reviewer", "publish")
@@ -33,6 +36,8 @@ class TransitFlowTest(unittest.TestCase):
         self.assertEqual(self.db.route(self.stops["S1"], self.stops["S5"], v2)["minutes"], 18)
         # Publishing v2 as a draft snapshot does not alter the old published v1.
         self.assertEqual(self.db.route(self.stops["S1"], self.stops["S5"], v1)["minutes"], 31)
+        self.db.evaluate_notifications(v2, "planner-02", "planner")
+        self.db.confirm_notifications(v2, "planner-02", "planner")
         self.db.transition(v2, "planner-02", "planner", "submit")
         self.db.transition(v2, "reviewer-02", "reviewer", "approve")
         self.db.transition(v2, "reviewer-02", "reviewer", "publish")
